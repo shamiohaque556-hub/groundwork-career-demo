@@ -32,6 +32,15 @@ def setup_profiles():
     with connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS profiles (session TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL)')
 
+ACTIVITIES=['Being a farmer or grower','Being a technician','Working in sales & marketing','Working with technology','Building a business','Researching & experimenting','Managing operations & supply','Teaching & supporting farmers','Something else','I do not know yet']
+PURPOSES=['Explore a job or career','Explore a business idea','Decide what to study','Improve my current work','Understand the field','I am not sure yet']
+EXPOSURE=['Completely new','Read or watched things','Studied a related subject','Visited a farm or workplace','Helped family or worked in it','Currently working in it']
+EXPECTATIONS=['See a normal working day','Talk to someone doing the work','Visit a farm or workplace','Try a guided activity','Understand skills and learning paths','Compare different kinds of work','Suggest a starting point']
+
+def setup_questions():
+    with connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS agriculture_answers (session TEXT PRIMARY KEY REFERENCES sessions(id), answers TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'GroundworkDemo/1'
     def log_message(self, fmt, *args):
@@ -67,6 +76,10 @@ class Handler(BaseHTTPRequestHandler):
         return digest
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path == '/api/agriculture':
+            sid=self.session()
+            with connect() as c: row=c.execute('SELECT answers FROM agriculture_answers WHERE session=?',(sid,)).fetchone()
+            return self.reply(200,json.loads(row[0]) if row else None)
         if path == '/api/profile':
             sid=self.session()
             with connect() as c: row=c.execute('SELECT data FROM profiles WHERE session=?',(sid,)).fetchone()
@@ -97,6 +110,26 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,UnicodeDecodeError): return self.reply(400,{'error':'Invalid request.'})
         sid=self.session()
         path=urlsplit(self.path).path
+        if path=='/api/agriculture':
+            with connect() as c: has_profile=c.execute('SELECT 1 FROM profiles WHERE session=?',(sid,)).fetchone()
+            if not has_profile: return self.reply(409,{'error':'Please save your introduction first.'})
+            clean={}
+            for key,allowed in [('activities',ACTIVITIES),('purpose',PURPOSES),('experience',EXPOSURE),('expectations',EXPECTATIONS)]:
+                value=data.get(key)
+                if not isinstance(value,list) or not value or len(value)>len(allowed) or any(not isinstance(v,str) or v not in allowed for v in value):
+                    return self.reply(400,{'error':'Please choose a valid answer for every question.'})
+                if len(value)!=len(set(value)): return self.reply(400,{'error':'Duplicate selections are not allowed.'})
+                exclusive={'I do not know yet','I am not sure yet','Completely new','Suggest a starting point'}
+                if len(value)>1 and any(v in exclusive for v in value): return self.reply(400,{'error':'Choose uncertainty on its own, or select specific options.'})
+                clean[key]=value
+                note=data.get(key+'_note','')
+                if not isinstance(note,str) or len(note)>1200: return self.reply(400,{'error':'Keep each note under 1,200 characters.'})
+                clean[key+'_note']=note.strip()
+            if 'Something else' in clean['activities'] and not clean['activities_note']:
+                return self.reply(400,{'error':'Please describe the other activity you have in mind.'})
+            with connect() as c:
+                c.execute('INSERT INTO agriculture_answers(session,answers) VALUES (?,?) ON CONFLICT(session) DO UPDATE SET answers=excluded.answers,updated_at=CURRENT_TIMESTAMP',(sid,json.dumps(clean)))
+            return self.reply(200,clean)
         if path=='/api/profile':
             name=data.get('name','')
             age=data.get('age')
@@ -115,7 +148,9 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('INSERT INTO profiles VALUES (?,?) ON CONFLICT(session) DO UPDATE SET data=excluded.data',(sid,json.dumps(clean)))
             return self.reply(200,clean)
         if path=='/api/reset':
-            with connect() as c: c.execute('DELETE FROM interests WHERE session=?',(sid,))
+            with connect() as c:
+                c.execute('DELETE FROM interests WHERE session=?',(sid,))
+                c.execute('DELETE FROM agriculture_answers WHERE session=?',(sid,))
             return self.reply(200,{'ok':True})
         exp=data.get('experience')
         if exp not in {e['id'] for e in EXPERIENCES}: return self.reply(400,{'error':'Choose an experience.'})
@@ -143,6 +178,7 @@ if __name__=='__main__':
     args=parser.parse_args()
     setup()
     setup_profiles()
+    setup_questions()
     try: server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
     except OSError as e:
         raise SystemExit(f'Could not start on port {args.port}: {e}. Try: py -3 server.py --port 8011 --open')
